@@ -14,8 +14,10 @@ mod switch;
 #[allow(clippy::module_inception)]
 mod task;
 
+use crate::config::MAX_SYSCALL_NUM;
 use crate::loader::{get_app_data, get_num_app};
 use crate::sync::UPSafeCell;
+use crate::timer::get_time_ms;
 use crate::trap::TrapContext;
 use alloc::vec::Vec;
 use lazy_static::*;
@@ -44,6 +46,10 @@ pub struct TaskManager {
 struct TaskManagerInner {
     /// task list
     tasks: Vec<TaskControlBlock>,
+    /// syscall times of tasks
+    syscall_times: Vec<[u32; MAX_SYSCALL_NUM]>,
+    /// the time tasks was first run
+    first_time: Vec<usize>,
     /// id of current `Running` task
     current_task: usize,
 }
@@ -55,14 +61,20 @@ lazy_static! {
         let num_app = get_num_app();
         println!("num_app = {}", num_app);
         let mut tasks: Vec<TaskControlBlock> = Vec::new();
+        let mut syscall_times: Vec<[u32; MAX_SYSCALL_NUM]> = Vec::new();
+        let mut first_time: Vec<usize> = Vec::new();
         for i in 0..num_app {
             tasks.push(TaskControlBlock::new(get_app_data(i), i));
+            syscall_times.push([0; MAX_SYSCALL_NUM]);
+            first_time.push(0);
         }
         TaskManager {
             num_app,
             inner: unsafe {
                 UPSafeCell::new(TaskManagerInner {
                     tasks,
+                    syscall_times,
+                    first_time,
                     current_task: 0,
                 })
             },
@@ -77,6 +89,7 @@ impl TaskManager {
     /// But in ch4, we load apps statically, so the first task is a real app.
     fn run_first_task(&self) -> ! {
         let mut inner = self.inner.exclusive_access();
+        inner.first_time[0] = get_time_ms();
         let next_task = &mut inner.tasks[0];
         next_task.task_status = TaskStatus::Running;
         let next_task_cx_ptr = &next_task.task_cx as *const TaskContext;
@@ -138,6 +151,9 @@ impl TaskManager {
     fn run_next_task(&self) {
         if let Some(next) = self.find_next_task() {
             let mut inner = self.inner.exclusive_access();
+            if inner.first_time[next] == 0 {
+                inner.first_time[next] = get_time_ms();
+            }
             let current = inner.current_task;
             inner.tasks[next].task_status = TaskStatus::Running;
             inner.current_task = next;
@@ -152,6 +168,39 @@ impl TaskManager {
         } else {
             panic!("All applications completed!");
         }
+    }
+
+    /// Increase syscall times of current task
+    fn increase_current_syscall_times(&self, id: usize) {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.syscall_times[current][id] = inner.syscall_times[current][id] + 1;
+    }
+
+    /// Get the current 'Running' task's syscall times
+    fn get_current_syscall_times(&self) -> [u32; MAX_SYSCALL_NUM] {
+        let inner = self.inner.exclusive_access();
+        inner.syscall_times[inner.current_task].clone()
+    }
+
+    /// Get the current 'Running' task's total running time
+    fn get_current_running_time(&self) -> usize {
+        let inner = self.inner.exclusive_access();
+        get_time_ms() - inner.first_time[inner.current_task]
+    }
+
+    /// mmap
+    fn mmap(&self, start: usize, len: usize, port: usize) -> bool {
+        let mut inner = self.inner.exclusive_access();
+        let current_task = inner.current_task;
+        inner.tasks[current_task].mmap(start, len, port)
+    }
+
+    /// munmap
+    fn munmap(&self, start: usize, len: usize) -> bool {
+        let mut inner = self.inner.exclusive_access();
+        let current_task = inner.current_task;
+        inner.tasks[current_task].munmap(start, len)
     }
 }
 
@@ -201,4 +250,31 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 /// Change the current 'Running' task's program break
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+
+/// Get the current 'Running' task's syscall times
+pub fn current_syscall_times() -> [u32; MAX_SYSCALL_NUM] {
+    TASK_MANAGER.get_current_syscall_times()
+}
+
+/// Get the current 'Running' task's total running time
+pub fn current_running_time() -> usize {
+    TASK_MANAGER.get_current_running_time()
+}
+
+///
+pub fn increase_current_syscall_times(id: usize) {
+    TASK_MANAGER.increase_current_syscall_times(id);
+}
+
+/// Current 'Running' task mmap
+/// true -> success
+/// false -> false
+pub fn mmap_current(start: usize, len: usize, port: usize) -> bool {
+    TASK_MANAGER.mmap(start, len, port)
+}
+
+/// Current 'Running' task munmap
+pub fn munmap_current(start: usize, len: usize) -> bool {
+    TASK_MANAGER.munmap(start, len)
 }
